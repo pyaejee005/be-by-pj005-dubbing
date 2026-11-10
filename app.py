@@ -589,16 +589,17 @@ def validate_dubbing_json(payload):
         if end_ms <= start_ms:
             raise ValueError(f"segments အမှတ် {index} ၏ ပြီးဆုံးချိန်သည် စတင်ချိန်ထက် နောက်ကျရမည်။")
         age_group = str(raw.get("age_group", "unknown")).strip().lower()
+        age_group = {"child": "kid", "young": "youth", "young_adult": "youth", "teen": "youth", "teenager": "youth"}.get(age_group, age_group)
+        if age_group not in {"kid", "youth", "adult", "unknown"}:
+            age_group = "unknown"
         gender = str(raw.get("gender", "unknown")).strip().lower()
         voice_type = str(raw.get("voice_type", "unknown")).strip().lower()
-        allowed_voice_types = {"adult_male", "adult_female", "kid_male", "kid_female", "unknown"}
+        allowed_voice_types = {"kid_male", "kid_female", "youth_male", "youth_female", "adult_male", "adult_female", "unknown"}
         if voice_type not in allowed_voice_types:
             voice_type = "unknown"
         if voice_type == "unknown":
-            if age_group == "kid" and gender in {"male", "female"}:
-                voice_type = f"kid_{gender}"
-            elif gender in {"male", "female"}:
-                voice_type = f"adult_{gender}"
+            if age_group in {"kid", "youth", "adult"} and gender in {"male", "female"}:
+                voice_type = f"{age_group}_{gender}"
         segments.append({
             "cue_id": str(raw.get("cue_id", index)),
             "start": str(raw.get("start", "")),
@@ -617,24 +618,61 @@ def validate_dubbing_json(payload):
     return segments, warnings
 
 
-def default_voice_for_type(voice_type, gender="unknown"):
-    if voice_type.endswith("female") or gender == "female":
-        return "v2"
-    return "v1"
+VOICE_PITCH_MAP = {
+    ("kid", "male"): ("v1", 20),
+    ("kid", "female"): ("v2", 20),
+    ("youth", "male"): ("v4", 0),
+    ("youth", "female"): ("v11", 0),
+    ("adult", "male"): ("v3", -10),
+    ("adult", "female"): ("v6", -10),
+}
+
+
+def resolve_voice_config(segment):
+    """Choose a fixed voice and pitch from JSON age group and gender."""
+    age_group = segment.get("age_group", "unknown")
+    gender = segment.get("gender", "unknown")
+    voice_type = segment.get("voice_type", "unknown")
+    if age_group not in {"kid", "youth", "adult"} and voice_type != "unknown":
+        parts = voice_type.split("_", 1)
+        if len(parts) == 2 and parts[0] in {"kid", "youth", "adult"}:
+            age_group = parts[0]
+            if gender not in {"male", "female"} and parts[1] in {"male", "female"}:
+                gender = parts[1]
+    if age_group not in {"kid", "youth", "adult"}:
+        age_group = "youth"
+    if gender not in {"male", "female"}:
+        if voice_type.endswith("_female"):
+            gender = "female"
+        else:
+            gender = "male"
+    return VOICE_PITCH_MAP[(age_group, gender)]
+
+
+def build_speaker_voice_map(segments):
+    """Keep one fixed voice/pitch pair per speaker, based on the first cue."""
+    speaker_map = {}
+    conflicts = set()
+    for segment in segments:
+        speaker_id = segment["speaker_id"]
+        config = resolve_voice_config(segment)
+        if speaker_id not in speaker_map:
+            speaker_map[speaker_id] = config
+        elif speaker_map[speaker_id] != config:
+            conflicts.add(speaker_id)
+    return speaker_map, sorted(conflicts)
 
 
 async def generate_dubbing_audio(segments, audio_dir, speaker_voice_map, max_workers=3):
-    """Generate each dubbing line with a bounded number of concurrent TTS calls."""
+    """Generate each line concurrently with fixed per-speaker voice and pitch."""
     semaphore = asyncio.Semaphore(max(1, int(max_workers)))
 
     async def generate_one(index, segment):
-        voice_id = speaker_voice_map.get(segment["speaker_id"], default_voice_for_type(segment["voice_type"], segment["gender"]))
-        # Edge TTS has no native child voice in the available Burmese voice list.
-        pitch = 20 if segment["age_group"] == "kid" or segment["voice_type"].startswith("kid_") else 0
+        voice_id, pitch = speaker_voice_map[segment["speaker_id"]]
         audio_path = os.path.join(audio_dir, f"line_{index:05d}.mp3")
         async with semaphore:
             await generate_tts_async(segment["text"], audio_path, voice_id, 0, pitch)
-        return {"segment": segment, "audio_path": audio_path, "voice_id": voice_id}
+        return {"segment": segment, "audio_path": audio_path, "voice_id": voice_id, "pitch": pitch}
 
     return await asyncio.gather(*(generate_one(i, seg) for i, seg in enumerate(segments)))
 
@@ -688,8 +726,7 @@ def main():
 
     json_file = st.file_uploader("ဒပ်လုပ် JSON ဖိုင်", type=["json"], key="dubbing_json_file")
     video_file = st.file_uploader("မူရင်းဗီဒီယို", type=["mp4", "mov", "avi", "mkv"], key="dubbing_video_file")
-    max_workers = st.slider("တစ်ပြိုင်နက် အသံဖန်တီးမည့် စာကြောင်းအရေအတွက်", min_value=1, max_value=8, value=3, step=1)
-    st.caption("လက်ရှိအသံစာရင်းတွင် ကလေးအသံအစစ် မပါပါ။ ကလေးအသံအမျိုးအစားများအတွက် သက်ဆိုင်ရာ မြန်မာလူကြီးအသံကို အသံမြင့်အောင် ပြောင်းသုံးပါမည်။")
+    max_workers = 3
 
     segments = None
     json_warnings = []
@@ -705,21 +742,9 @@ def main():
 
     speaker_voice_map = {}
     if segments:
-        speaker_info = {}
-        for segment in segments:
-            speaker_info.setdefault(segment["speaker_id"], segment)
-        st.subheader("ဇာတ်ကောင်တစ်ဦးစီအတွက် အသံ")
-        voice_labels = {"v1": "သီဟ — မြန်မာအမျိုးသားအသံ", "v2": "နီလာ — မြန်မာအမျိုးသမီးအသံ"}
-        for speaker_id, info in speaker_info.items():
-            default_id = default_voice_for_type(info["voice_type"], info["gender"])
-            choice = st.selectbox(
-                f"{speaker_id} ({info['voice_type']})",
-                options=["v1", "v2"],
-                index=0 if default_id == "v1" else 1,
-                format_func=lambda value: voice_labels[value],
-                key=f"speaker_voice_{speaker_id}",
-            )
-            speaker_voice_map[speaker_id] = choice
+        speaker_voice_map, conflicting_speakers = build_speaker_voice_map(segments)
+        for speaker_id in conflicting_speakers:
+            st.warning(f"{speaker_id} အတွက် အသက်အုပ်စု သို့မဟုတ် ကျား/မ မတူညီနေသည်။ ပထမစာကြောင်း၏ အသံကို အားလုံးအတွက် သုံးမည်။")
 
         if video_file is not None and st.button("ဒပ်လုပ်ဗီဒီယို ဖန်တီးရန်", type="primary", use_container_width=True):
             work_dir = tempfile.mkdtemp(prefix="be_dubbing_")
